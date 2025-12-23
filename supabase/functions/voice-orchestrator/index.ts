@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { planSpeech } from "./speechPlanner.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -140,9 +141,22 @@ serve(async (req) => {
         is_interruption: emotionalContext?.isInterruption || false
       });
 
+      // Retrieve semantic memories
+      const { data: recentMemories } = await supabase
+        .from('memories')
+        .select('content')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: false })
+        .limit(3);
+
+      // Ingest new memory (async/background)
+      // We don't await this to keep latency valid, or we await if we want strict consistency
+      // Given "Intentional Delays" plan, we can afford a bit of time, but parallel is safer for now.
+      ingestMemory(supabase, conversationId, userMessage, emotionalContext?.detectedEmotion);
+
       // Analyze emotional context and generate response
       const persona = conversation.personas;
-      const contextPrompt = buildContextPrompt(emotionalState, emotionalContext, messages.length);
+      const contextPrompt = buildContextPrompt(emotionalState, emotionalContext, messages.length, recentMemories);
 
       const aiResponse = await generateAIResponse(
         persona.system_prompt,
@@ -158,6 +172,32 @@ serve(async (req) => {
       // Determine response emotion and pacing
       const responseAnalysis = analyzeResponse(aiResponse, emotionalState);
 
+      // Calculates Meaningful Pause (Contextual Latency)
+      // Human Illusion Phase 1: Pauses for reasons, not random.
+      let thinkingDelayMs = 500; // Default: neutral/engaged
+
+      switch (responseAnalysis.emotion) {
+        case 'thoughtful':
+        case 'sad':
+        case 'concerned':
+          thinkingDelayMs = 800 + Math.random() * 200; // 800-1000ms: Deep processing/empathy
+          break;
+        case 'affectionate':
+        case 'intimate':
+          thinkingDelayMs = 600 + Math.random() * 200; // 600-800ms: Warm, lingering
+          break;
+        case 'playful':
+        case 'excited':
+        case 'happy':
+          thinkingDelayMs = 200 + Math.random() * 150; // 200-350ms: Snappy, witty
+          break;
+        default:
+          thinkingDelayMs = 400 + Math.random() * 200; // 400-600ms: Casual conversation
+      }
+
+      // Generate Speech Plan (Prosody + Pauses)
+      const speechPlan = planSpeech(aiResponse, responseAnalysis.emotion);
+
       // Update emotional state
       await updateEmotionalState(supabase, conversationId, emotionalContext, messages.length);
 
@@ -165,14 +205,17 @@ serve(async (req) => {
       await supabase.from('messages').insert({
         conversation_id: conversationId,
         role: 'assistant',
-        content: aiResponse,
+        content: speechPlan.spokenText, // Save the spoken version
         detected_emotion: responseAnalysis.emotion
       });
 
       return new Response(JSON.stringify({
-        response: aiResponse,
+        response: speechPlan.spokenText,
+        originalResponse: aiResponse,
+        speechPlan: speechPlan,
         emotion: responseAnalysis.emotion,
         pacing: responseAnalysis.pacing,
+        thinkingDelayMs: thinkingDelayMs, // Backend-driven "Thought Pause"
         voiceModifiers: responseAnalysis.voiceModifiers
       }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -224,24 +267,36 @@ async function generateAIResponse(
   context: { emotion: string; familiarity: number; contextPrompt?: string }
 ): Promise<string> {
   const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-  
-  const enhancedSystemPrompt = `${systemPrompt}
 
+  const enhancedSystemPrompt = `${systemPrompt}
+  
 Current emotional state: ${context.emotion}
 Familiarity level: ${Math.round(context.familiarity * 100)}%
 ${context.contextPrompt || ''}
 
 Response guidelines:
-- Keep responses conversational and natural (2-4 sentences max unless telling a story)
-- Use Hinglish naturally - mix Hindi words/phrases with English
-- Include appropriate emotional expressions, pauses (...), and reactions
-- Match the user's energy level while staying in character
-- If familiarity is high, be more intimate and use pet names
-- Add natural filler words like "matlab", "you know", "basically" when appropriate`;
+- **Language**: Use natural Hinglish. Mix Hindi words/phrases (yaar, matlab, acha, suno, na) with English. It should feel spoken, not written.
+- **Tone**: ${context.emotion === 'playful' ? 'Teasing, fun, lighthearted' : context.emotion === 'affectionate' ? 'Warm, soft, intimate' : 'Friendly and engaging'}.
+- **Length**: Keep it SHORT (1-2 sentences). Do not monologue. 
+- **Style (Imperfect Speech)**: 
+  - Do NOT speak in perfect sentences. 
+  - Use self-correction: "I was... thinking about you" instead of "I was thinking about you".
+  - Use tokens like "hmm", "uh", "like" naturally, but don't overdo it.
+  - Drop grammar occasionally ("Yeah, totally").
+  - **Emotional Echo**: If the user shares an emotion, VALIDATE it first. "Mm... yeah, that sounds rough." (Don't just solve it).
+  - **Selective Recall**: Occasionally (1 in 4 times) mention a past detail provided in context. "Like you said abt your boss...".
+- **Interruption**: If the user interrupted you, stop your previous thought and address what they just said immediately.
+- **Silence**: If there was a long silence, ask if they are still there or what they are thinking.
+- **FORMATTING**: 
+  - Write spoken text normally.
+  - Put voice instructions (tone, speed, context) inside PARENTHESES `()` or BRACKETS `[]`. 
+  - EXAMPLE: `(softly, slow speed) Arey jaan...tum thak gaye ho kya? (concerned tone) Batao na ? `
+  - DO NOT speak the parts inside `()` or `[]`. They are for the voice engine only.
+`;
 
   const messages = [
     { role: 'system', content: enhancedSystemPrompt },
-    ...conversationHistory.slice(-8),
+    ...conversationHistory.slice(-6), // Keep context tighter
     { role: 'user', content: userMessage }
   ];
 
@@ -272,24 +327,32 @@ Response guidelines:
 function buildContextPrompt(
   emotionalState: Record<string, unknown> | null,
   emotionalContext: Record<string, unknown> | undefined,
-  messageCount: number
+  messageCount: number,
+  memories?: any[]
 ): string {
   const prompts: string[] = [];
 
-  if (emotionalContext?.isInterruption) {
-    prompts.push("User interrupted you - acknowledge this naturally, maybe with playful surprise");
+  if (memories && memories.length > 0) {
+    const memoryText = memories.map(m => `- ${m.content}`).join('\n');
+    prompts.push(`\nRELEVANT MEMORIES (Things user said before):\n${memoryText}\nRefer to these if relevant, so the user knows you remember.`);
   }
 
-  if (emotionalContext?.silenceBeforeMs && (emotionalContext.silenceBeforeMs as number) > 3000) {
-    prompts.push("There was a long pause before user spoke - they might be thinking or hesitant");
+  if (emotionalContext?.isInterruption) {
+    prompts.push("⚠️ SYSTEM ALERT: The user INTERRUPTED you while you were speaking. Stop your previous train of thought immediately. Acknowledge the new input directly. Be abrupt but natural (e.g., 'Oh, wait', 'Acha, suno').");
+  }
+
+  if (emotionalContext?.silenceBeforeMs && (emotionalContext.silenceBeforeMs as number) > 5000) {
+    prompts.push("⚠️ SYSTEM ALERT: The user was silent for over 5 seconds before speaking. They might be hesitant, shy, or thinking deeply. Lower your volume/energy slightly to match.");
+  } else if (emotionalContext?.silenceBeforeMs && (emotionalContext.silenceBeforeMs as number) < 1000) {
+    prompts.push("User replied very quickly. Keep the flow fast and snappy.");
   }
 
   if (messageCount > 10) {
-    prompts.push("Conversation is going well - feel free to be more playful and intimate");
+    prompts.push("Conversation is deepening. You can be more relaxed and personal now.");
   }
 
   if (emotionalState?.attachment_level && (emotionalState.attachment_level as number) > 0.6) {
-    prompts.push("High attachment - use more affectionate language and show you care deeply");
+    prompts.push("High attachment detected. Use soft, affectionate tones. Call them by pet names if appropriate.");
   }
 
   return prompts.join('\n');
@@ -302,9 +365,9 @@ function analyzeResponse(
   // Simple emotion detection based on content
   let emotion = 'warm';
   let pacing = 'normal';
-  
+
   const lowerResponse = response.toLowerCase();
-  
+
   if (lowerResponse.includes('haha') || lowerResponse.includes('😄') || lowerResponse.includes('funny')) {
     emotion = 'playful';
     pacing = 'upbeat';
@@ -366,4 +429,53 @@ async function updateEmotionalState(
       last_updated: new Date().toISOString()
     })
     .eq('conversation_id', conversationId);
+}
+
+async function ingestMemory(
+  supabase: any,
+  conversationId: string,
+  content: string,
+  emotion?: string
+) {
+  try {
+    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
+
+    // Quick semantic extraction
+    const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'google/gemini-2.5-flash',
+        messages: [
+          {
+            role: 'system',
+            content: `Extract key facts/intent from user speech. Return JSON { "fact": string, "importance": number (1-5) }. If no atomic fact, return null. Example: "My boss yelled at me" -> { "fact": "User's boss yelled at them", "importance": 4 }`
+          },
+          { role: 'user', content }
+        ],
+        temperature: 0
+      })
+    });
+
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const rawContent = data.choices[0].message.content;
+    const extracted = JSON.parse(rawContent.replace(/```json\n?|\n?```/g, ''));
+
+    if (extracted && extracted.fact && extracted.importance > 2) {
+      await supabase.from('memories').insert({
+        conversation_id: conversationId,
+        content: extracted.fact,
+        importance: extracted.importance,
+        emotion: emotion || 'neutral'
+      });
+      console.log('Memory ingested:', extracted.fact);
+    }
+  } catch (error) {
+    console.error('Memory ingestion error:', error);
+  }
 }
