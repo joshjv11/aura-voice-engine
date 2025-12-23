@@ -141,18 +141,21 @@ serve(async (req) => {
         is_interruption: emotionalContext?.isInterruption || false
       });
 
-      // Retrieve semantic memories
+      // Retrieve semantic memories from conversation_memories table
       const { data: recentMemories } = await supabase
-        .from('memories')
-        .select('content')
+        .from('conversation_memories')
+        .select('content, importance, emotion')
         .eq('conversation_id', conversationId)
         .order('created_at', { ascending: false })
-        .limit(3);
+        .limit(5);
 
-      // Ingest new memory (async/background)
-      // We don't await this to keep latency valid, or we await if we want strict consistency
-      // Given "Intentional Delays" plan, we can afford a bit of time, but parallel is safer for now.
-      ingestMemory(supabase, conversationId, userMessage, emotionalContext?.detectedEmotion);
+      console.log('[MEMORY] Retrieved memories for context:', recentMemories?.length || 0, 'items');
+      if (recentMemories && recentMemories.length > 0) {
+        console.log('[MEMORY] Memory contents:', recentMemories.map(m => m.content));
+      }
+
+      // Ingest new memory (with logging)
+      ingestMemory(supabase, conversationId, userMessage, emotionalContext?.detectedEmotion as string | undefined);
 
       // Analyze emotional context and generate response
       const persona = conversation.personas;
@@ -437,9 +440,11 @@ async function ingestMemory(
   emotion?: string
 ) {
   try {
+    console.log('[MEMORY INGEST] Raw user speech:', content);
+    
     const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
 
-    // Quick semantic extraction
+    // Semantic extraction via AI
     const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -451,7 +456,13 @@ async function ingestMemory(
         messages: [
           {
             role: 'system',
-            content: `Extract key facts/intent from user speech. Return JSON { "fact": string, "importance": number (1-5) }. If no atomic fact, return null. Example: "My boss yelled at me" -> { "fact": "User's boss yelled at them", "importance": 4 }`
+            content: `Extract key facts, preferences, or emotional details from user speech. 
+Return JSON: { "fact": string | null, "importance": number (1-5), "category": "personal" | "preference" | "emotional" | "event" }
+If no memorable fact, return { "fact": null }.
+Examples:
+- "My boss yelled at me" -> { "fact": "User's boss yelled at them today", "importance": 4, "category": "event" }
+- "I love chai" -> { "fact": "User loves chai", "importance": 3, "category": "preference" }
+- "hmm ok" -> { "fact": null }`
           },
           { role: 'user', content }
         ],
@@ -459,22 +470,36 @@ async function ingestMemory(
       })
     });
 
-    if (!response.ok) return;
+    if (!response.ok) {
+      console.error('[MEMORY INGEST] AI extraction failed:', await response.text());
+      return;
+    }
 
     const data = await response.json();
     const rawContent = data.choices[0].message.content;
-    const extracted = JSON.parse(rawContent.replace(/```json\n?|\n?```/g, ''));
+    console.log('[MEMORY INGEST] AI extraction result:', rawContent);
+    
+    // Clean JSON from markdown code blocks
+    const cleanJson = rawContent.replace(/```json\n?|\n?```/g, '').trim();
+    const extracted = JSON.parse(cleanJson);
 
-    if (extracted && extracted.fact && extracted.importance > 2) {
-      await supabase.from('memories').insert({
+    if (extracted && extracted.fact && extracted.importance >= 2) {
+      const { error: insertError } = await supabase.from('conversation_memories').insert({
         conversation_id: conversationId,
         content: extracted.fact,
         importance: extracted.importance,
         emotion: emotion || 'neutral'
       });
-      console.log('Memory ingested:', extracted.fact);
+      
+      if (insertError) {
+        console.error('[MEMORY INGEST] Insert error:', insertError);
+      } else {
+        console.log('[MEMORY INGEST] ✓ Stored memory:', extracted.fact, '(importance:', extracted.importance, ')');
+      }
+    } else {
+      console.log('[MEMORY INGEST] No significant fact to store');
     }
   } catch (error) {
-    console.error('Memory ingestion error:', error);
+    console.error('[MEMORY INGEST] Error:', error);
   }
 }
