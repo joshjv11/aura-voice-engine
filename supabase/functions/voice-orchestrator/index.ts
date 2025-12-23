@@ -156,7 +156,7 @@ serve(async (req) => {
 
       // Analyze emotional context and generate response
       const persona = conversation.personas;
-      const contextPrompt = buildContextPrompt(emotionalState, emotionalContext, messages.length, recentMemories);
+      const contextPrompt = buildContextPrompt(emotionalState, emotionalContext, messages.length, recentMemories || undefined);
 
       const aiResponse = await generateAIResponse(
         persona.system_prompt,
@@ -268,31 +268,30 @@ async function generateAIResponse(
 ): Promise<string> {
   const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
 
-  const enhancedSystemPrompt = `${systemPrompt}
+  const toneDescription = context.emotion === 'playful' ? 'Teasing, fun, lighthearted' : context.emotion === 'affectionate' ? 'Warm, soft, intimate' : 'Friendly and engaging';
   
-Current emotional state: ${context.emotion}
-Familiarity level: ${Math.round(context.familiarity * 100)}%
-${context.contextPrompt || ''}
-
-Response guidelines:
-- **Language**: Use natural Hinglish. Mix Hindi words/phrases (yaar, matlab, acha, suno, na) with English. It should feel spoken, not written.
-- **Tone**: ${context.emotion === 'playful' ? 'Teasing, fun, lighthearted' : context.emotion === 'affectionate' ? 'Warm, soft, intimate' : 'Friendly and engaging'}.
-- **Length**: Keep it SHORT (1-2 sentences). Do not monologue. 
-- **Style (Imperfect Speech)**: 
-  - Do NOT speak in perfect sentences. 
-  - Use self-correction: "I was... thinking about you" instead of "I was thinking about you".
-  - Use tokens like "hmm", "uh", "like" naturally, but don't overdo it.
-  - Drop grammar occasionally ("Yeah, totally").
-  - **Emotional Echo**: If the user shares an emotion, VALIDATE it first. "Mm... yeah, that sounds rough." (Don't just solve it).
-  - **Selective Recall**: Occasionally (1 in 4 times) mention a past detail provided in context. "Like you said abt your boss...".
-- **Interruption**: If the user interrupted you, stop your previous thought and address what they just said immediately.
-- **Silence**: If there was a long silence, ask if they are still there or what they are thinking.
-- **FORMATTING**: 
-  - Write spoken text normally.
-  - Put voice instructions (tone, speed, context) inside PARENTHESES `()` or BRACKETS `[]`. 
-  - EXAMPLE: `(softly, slow speed) Arey jaan...tum thak gaye ho kya? (concerned tone) Batao na ? `
-  - DO NOT speak the parts inside `()` or `[]`. They are for the voice engine only.
-`;
+  const enhancedSystemPrompt = systemPrompt + "\n\n" +
+    "Current emotional state: " + context.emotion + "\n" +
+    "Familiarity level: " + Math.round(context.familiarity * 100) + "%\n" +
+    (context.contextPrompt || '') + "\n\n" +
+    "Response guidelines:\n" +
+    "- Language: Use natural Hinglish. Mix Hindi words (yaar, matlab, acha, suno, na) with English. Feel spoken, not written.\n" +
+    "- Tone: " + toneDescription + ".\n" +
+    "- Length: Keep it SHORT (1-2 sentences). Do not monologue.\n" +
+    "- Style (Imperfect Speech):\n" +
+    "  - Do NOT speak in perfect sentences.\n" +
+    "  - Use self-correction: 'I was... thinking about you' instead of perfect grammar.\n" +
+    "  - Use tokens like 'hmm', 'uh', 'like' naturally but sparingly.\n" +
+    "  - Drop grammar occasionally ('Yeah, totally').\n" +
+    "  - Emotional Echo: If user shares emotion, VALIDATE first. 'Mm... yeah, that sounds rough.'\n" +
+    "  - Selective Recall: Occasionally mention past details from context.\n" +
+    "- Interruption: If interrupted, stop previous thought and address new input immediately.\n" +
+    "- Silence: If long silence, ask if they are still there.\n" +
+    "- FORMATTING:\n" +
+    "  - Write spoken text normally.\n" +
+    "  - Put voice instructions (tone, speed) inside parentheses () or brackets [].\n" +
+    "  - Example: (softly) Arey jaan...tum thak gaye ho kya?\n" +
+    "  - DO NOT speak the parts inside () or []. They are for voice engine only.";
 
   const messages = [
     { role: 'system', content: enhancedSystemPrompt },
