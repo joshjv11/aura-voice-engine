@@ -5,12 +5,12 @@ export interface SpeechPlan {
         text: string;
         pauseAfterMs?: number;
         emotionModifier?: string;
-        pace?: number; // Added for Speech Rate Drift
+        pace?: number;
     }[];
 }
 
 export function planSpeech(text: string, currentEmotion: string): SpeechPlan {
-    // ... (Cleaning logic remains same)
+    // Clean text: remove instructions in () or []
     let spoken = text
         .replace(/[\(\[\{].*?[\)\]\}]/gs, '')
         .replace(/\*/g, '')
@@ -19,31 +19,30 @@ export function planSpeech(text: string, currentEmotion: string): SpeechPlan {
         .replace(/\s+/g, ' ')
         .trim();
 
-    // ... (Filler logic remains same)
-    const fillers = {
+    // Probabilistic fillers based on emotion
+    const fillers: Record<string, string[]> = {
         thoughtful: ['hmm...', 'well...', 'like...'],
         playful: ['haha,', 'wait,', 'you know,'],
         affectionate: ['hmm...', 'acha,'],
         neutral: ['so,', 'basically,']
     };
 
-    const selectedFillers = fillers[currentEmotion as keyof typeof fillers] || fillers.neutral;
+    const selectedFillers = fillers[currentEmotion] || fillers.neutral;
     const useFiller = Math.random() > 0.85;
 
-    if (useFiller) {
+    if (useFiller && selectedFillers.length > 0) {
         const filler = selectedFillers[Math.floor(Math.random() * selectedFillers.length)];
         spoken = `${filler} ${spoken}`;
     }
 
-    // Segmenting
+    // Segment by punctuation
     const rawSegments = spoken.split(/([.,?!])+/).filter(s => s.trim().length > 0);
     const segments: SpeechPlan['segments'] = [];
 
     let currentSegment = "";
 
-    // Helper to determine pace based on position
-    // Start slow (thinking), then speed up (flowing)
-    const getPace = (index: number) => index === 0 ? 0.95 : 1.05;
+    // Pace drift: start slower (thinking), speed up (flowing)
+    const getPace = (index: number): number => index === 0 ? 0.95 : 1.05;
     let segmentIndex = 0;
 
     for (let i = 0; i < rawSegments.length; i++) {
