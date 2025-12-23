@@ -73,6 +73,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         let data;
 
         try {
+          // Use v3-beta with valid speaker "priya"
           const response = await fetch('https://api.sarvam.ai/text-to-speech', {
             method: 'POST',
             headers: {
@@ -82,20 +83,21 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
             body: JSON.stringify({
               inputs: [text],
               target_language_code: 'hi-IN',
-              speaker_gender: 'Female',
+              speaker: 'priya', // Must specify a valid speaker for v3-beta
               model: 'bulbul:v3-beta',
             })
           });
 
           if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`v3 failed: ${errText}`);
+            throw new Error(`v3-beta failed: ${errText}`);
           }
           data = await response.json();
 
         } catch (v3Error) {
-          console.warn('Sarvam v3 failed, falling back to v1:', v3Error);
+          console.warn('Sarvam v3-beta failed, falling back to v2:', v3Error);
 
+          // Fallback to v2 (v1 doesn't exist anymore)
           const response = await fetch('https://api.sarvam.ai/text-to-speech', {
             method: 'POST',
             headers: {
@@ -105,8 +107,8 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
             body: JSON.stringify({
               inputs: [text],
               target_language_code: 'hi-IN',
-              speaker_gender: 'Female',
-              model: 'bulbul:v1',
+              speaker: 'priya',
+              model: 'bulbul:v2',
               pitch: 0,
               pace: pace
             })
@@ -114,7 +116,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
 
           if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`v1 fallback also failed: ${errText}`);
+            throw new Error(`v2 fallback also failed: ${errText}`);
           }
           data = await response.json();
         }
