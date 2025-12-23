@@ -14,6 +14,41 @@ export type Database = {
   }
   public: {
     Tables: {
+      conversation_memories: {
+        Row: {
+          content: string
+          conversation_id: string
+          created_at: string
+          emotion: string | null
+          id: string
+          importance: number
+        }
+        Insert: {
+          content: string
+          conversation_id: string
+          created_at?: string
+          emotion?: string | null
+          id?: string
+          importance?: number
+        }
+        Update: {
+          content?: string
+          conversation_id?: string
+          created_at?: string
+          emotion?: string | null
+          id?: string
+          importance?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "conversation_memories_conversation_id_fkey"
+            columns: ["conversation_id"]
+            isOneToOne: false
+            referencedRelation: "conversations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       conversations: {
         Row: {
           ended_at: string | null
