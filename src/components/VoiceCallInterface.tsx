@@ -67,75 +67,40 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
           await audioContextRef.current.resume();
         }
 
-        console.log('Calling Sarvam TTS for:', text, 'Pace:', pace);
+        console.log('🎤 ElevenLabs TTS:', text.substring(0, 50) + '...', 'Emotion:', emotion);
         setIsSpeaking(true);
 
-        let data;
-
-        try {
-          // Use v3-beta with valid speaker "priya"
-          const response = await fetch('https://api.sarvam.ai/text-to-speech', {
+        // Use ElevenLabs via edge function for premium voice quality
+        const response = await fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/elevenlabs-tts`,
+          {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'api-subscription-key': 'sk_av2udgsa_X5NpkUJUYPLwoNJmpb9s5AA9'
+              'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
             },
             body: JSON.stringify({
-              inputs: [text],
-              target_language_code: 'hi-IN',
-              speaker: 'priya', // Must specify a valid speaker for v3-beta
-              model: 'bulbul:v3-beta',
-            })
-          });
-
-          if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`v3-beta failed: ${errText}`);
+              text,
+              emotion,
+              streaming: true, // Use streaming for lowest latency
+            }),
           }
-          data = await response.json();
+        );
 
-        } catch (v3Error) {
-          console.warn('Sarvam v3-beta failed, falling back to v2:', v3Error);
-
-          // Fallback to v2 (v1 doesn't exist anymore)
-          const response = await fetch('https://api.sarvam.ai/text-to-speech', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'api-subscription-key': 'sk_av2udgsa_X5NpkUJUYPLwoNJmpb9s5AA9'
-            },
-            body: JSON.stringify({
-              inputs: [text],
-              target_language_code: 'hi-IN',
-              speaker: 'priya',
-              model: 'bulbul:v2',
-              pitch: 0,
-              pace: pace
-            })
-          });
-
-          if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`v2 fallback also failed: ${errText}`);
-          }
-          data = await response.json();
+        if (!response.ok) {
+          const errText = await response.text();
+          console.error('TTS failed:', response.status, errText);
+          throw new Error(`TTS failed: ${response.status}`);
         }
 
-        if (!data.audios || !data.audios[0]) {
-          throw new Error('No audio data received');
-        }
-
-        const binaryString = window.atob(data.audios[0]);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        const audioBlob = new Blob([bytes], { type: 'audio/wav' });
-
+        // Get audio blob from streaming response
+        const audioBlob = await response.blob();
         const audioUrl = URL.createObjectURL(audioBlob);
 
         if (isInterruptionRef.current) {
           console.log('Interruption before play, skipping');
+          URL.revokeObjectURL(audioUrl);
           resolve();
           return;
         }
@@ -151,12 +116,15 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
           resolve();
         };
 
-        audio.onerror = () => {
+        audio.onerror = (e) => {
+          console.error('Audio playback error:', e);
           setIsSpeaking(false);
+          URL.revokeObjectURL(audioUrl);
           resolve();
         };
 
-        await audio.play().catch(() => resolve());
+        // Start playback immediately
+        await audio.play();
 
       } catch (error) {
         console.error('TTS error:', error);
