@@ -12,6 +12,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
   const [status, setStatus] = useState<'connecting' | 'active' | 'ended'>('connecting');
   const [isMuted, setIsMuted] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const [currentEmotion, setCurrentEmotion] = useState('neutral');
   const [transcript, setTranscript] = useState<Array<{ role: string; text: string }>>([]);
   const [lastUserSpeechTime, setLastUserSpeechTime] = useState(Date.now());
@@ -23,6 +24,16 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isInterruptionRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isRecordingRef = useRef(false);
+  const vadAnimationRef = useRef<number | null>(null);
+
+  // VAD configuration
+  const SILENCE_THRESHOLD = 25; // Lower = more sensitive
+  const SILENCE_DURATION = 1500; // ms of silence before processing
+  const MIN_SPEECH_DURATION = 300; // ms minimum speech before considering valid
 
   const startConversation = useCallback(async () => {
     try {
@@ -45,8 +56,8 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       // Play greeting audio
       await playTTS(data.greeting, 'excited');
 
-      // Start listening
-      await startListening();
+      // Start continuous listening with VAD
+      await startContinuousListening();
     } catch (error) {
       console.error('Failed to start:', error);
       toast({ title: 'Connection failed', variant: 'destructive' });
@@ -54,7 +65,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
     }
   }, [toast, onEndCall]);
 
-  const playTTS = async (text: string, emotion: string, pace: number = 1.0): Promise<void> => {
+  const playTTS = async (text: string, emotion: string): Promise<void> => {
     return new Promise(async (resolve) => {
       try {
         if (!text.trim()) {
@@ -70,7 +81,6 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         console.log('🎤 ElevenLabs TTS:', text.substring(0, 50) + '...', 'Emotion:', emotion);
         setIsSpeaking(true);
 
-        // Use ElevenLabs via edge function for premium voice quality
         const response = await fetch(
           `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/elevenlabs-tts`,
           {
@@ -83,7 +93,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
             body: JSON.stringify({
               text,
               emotion,
-              streaming: true, // Use streaming for lowest latency
+              streaming: false, // Use non-streaming for better quality
             }),
           }
         );
@@ -94,13 +104,13 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
           throw new Error(`TTS failed: ${response.status}`);
         }
 
-        // Get audio blob from streaming response
         const audioBlob = await response.blob();
         const audioUrl = URL.createObjectURL(audioBlob);
 
         if (isInterruptionRef.current) {
           console.log('Interruption before play, skipping');
           URL.revokeObjectURL(audioUrl);
+          setIsSpeaking(false);
           resolve();
           return;
         }
@@ -123,7 +133,6 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
           resolve();
         };
 
-        // Start playback immediately
         await audio.play();
 
       } catch (error) {
@@ -134,9 +143,28 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
     });
   };
 
-  const startListening = async () => {
+  const startContinuousListening = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
+      streamRef.current = stream;
+
+      // Setup audio context for VAD
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = audioContext;
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.8;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      // Create MediaRecorder
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -147,99 +175,148 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         }
       };
 
-      // VAD via AudioContext
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      audioContextRef.current = audioContext;
-      const source = audioContext.createMediaStreamSource(stream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const checkVolume = () => {
-        if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') return;
-
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        const average = sum / bufferLength;
-
-        // Threshold for interruption detection
-        if (average > 35 && isSpeaking && audioRef.current) {
-          console.log('VAD: User speaking during AI speech, triggering soft interrupt');
-          isInterruptionRef.current = true;
-          // Soft stop: fade out instead of hard cut
-          audioRef.current.volume = Math.max(0, audioRef.current.volume - 0.1);
-          if (audioRef.current.volume <= 0.1) {
-            audioRef.current.pause();
-            audioRef.current = null;
-            setIsSpeaking(false);
-          }
-        }
-        requestAnimationFrame(checkVolume);
-      };
-
-      checkVolume();
-
       mediaRecorder.onstop = async () => {
-        if (audioChunksRef.current.length === 0 || isProcessingRef.current) return;
+        if (audioChunksRef.current.length === 0 || isProcessingRef.current) {
+          // Restart recording immediately
+          if (status === 'active' && !isMuted && streamRef.current) {
+            startRecording();
+          }
+          return;
+        }
 
-        isProcessingRef.current = true;
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         audioChunksRef.current = [];
+        
+        // Only process if we have meaningful audio
+        if (audioBlob.size > 1000) {
+          await processUserAudio(audioBlob);
+        }
 
-        await processUserAudio(audioBlob);
-        isProcessingRef.current = false;
-
-        // Restart recording if still active
-        if (status === 'active' && mediaRecorderRef.current) {
-          mediaRecorderRef.current.start();
-          setTimeout(() => mediaRecorderRef.current?.stop(), 5000);
+        // Restart recording after processing
+        if (status === 'active' && !isMuted && streamRef.current) {
+          startRecording();
         }
       };
 
-      mediaRecorder.start();
-      setTimeout(() => mediaRecorder.stop(), 5000);
+      // Start VAD monitoring
+      startVADMonitoring();
+      
+      // Start initial recording
+      startRecording();
+      setIsListening(true);
+
     } catch (error) {
       console.error('Mic error:', error);
       toast({ title: 'Microphone access required', variant: 'destructive' });
     }
   };
 
-  const testAudio = async () => {
-    try {
-      console.log('Testing Audio Output...');
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      }
-      if (audioContextRef.current.state === 'suspended') {
-        await audioContextRef.current.resume();
-      }
-      const ctx = audioContextRef.current;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.setValueAtTime(440, ctx.currentTime);
-      gain.gain.setValueAtTime(0.1, ctx.currentTime);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.5);
-      toast({ title: "Test beep playing" });
-    } catch (e) {
-      console.error('Test Audio Failed:', e);
-      toast({ title: "Audio test failed", variant: "destructive" });
+  const startRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
+      audioChunksRef.current = [];
+      mediaRecorderRef.current.start(100); // Collect data every 100ms
+      isRecordingRef.current = true;
+      console.log('🎙️ Recording started');
     }
   };
 
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+      isRecordingRef.current = false;
+      console.log('🎙️ Recording stopped');
+    }
+  };
+
+  const startVADMonitoring = () => {
+    if (!analyserRef.current) return;
+
+    const analyser = analyserRef.current;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    let speechStartTime: number | null = null;
+    let lastSpeechTime = Date.now();
+
+    const checkVoiceActivity = () => {
+      if (!analyserRef.current || status !== 'active') return;
+
+      analyser.getByteFrequencyData(dataArray);
+      
+      // Calculate average volume
+      let sum = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        sum += dataArray[i];
+      }
+      const average = sum / bufferLength;
+
+      const isSpeaking = average > SILENCE_THRESHOLD;
+      const now = Date.now();
+
+      if (isSpeaking) {
+        if (!speechStartTime) {
+          speechStartTime = now;
+        }
+        lastSpeechTime = now;
+
+        // Clear any pending silence timeout
+        if (silenceTimeoutRef.current) {
+          clearTimeout(silenceTimeoutRef.current);
+          silenceTimeoutRef.current = null;
+        }
+
+        // Handle interruption if AI is speaking
+        if (audioRef.current && !isInterruptionRef.current) {
+          const speechDuration = now - speechStartTime;
+          if (speechDuration > MIN_SPEECH_DURATION) {
+            console.log('🔇 User interrupting AI, fading out');
+            isInterruptionRef.current = true;
+            // Soft fade out
+            const fadeOut = setInterval(() => {
+              if (audioRef.current) {
+                audioRef.current.volume = Math.max(0, audioRef.current.volume - 0.15);
+                if (audioRef.current.volume <= 0.1) {
+                  audioRef.current.pause();
+                  audioRef.current = null;
+                  setIsSpeaking(false);
+                  clearInterval(fadeOut);
+                }
+              } else {
+                clearInterval(fadeOut);
+              }
+            }, 50);
+          }
+        }
+      } else {
+        // Silence detected
+        const silenceDuration = now - lastSpeechTime;
+        
+        if (speechStartTime && silenceDuration > SILENCE_DURATION && isRecordingRef.current) {
+          const totalSpeechDuration = lastSpeechTime - speechStartTime;
+          
+          if (totalSpeechDuration > MIN_SPEECH_DURATION) {
+            console.log(`🔇 Silence detected after ${totalSpeechDuration}ms of speech, processing...`);
+            speechStartTime = null;
+            stopRecording();
+          }
+        }
+      }
+
+      vadAnimationRef.current = requestAnimationFrame(checkVoiceActivity);
+    };
+
+    checkVoiceActivity();
+  };
+
   const processUserAudio = async (audioBlob: Blob) => {
+    if (isProcessingRef.current) return;
+    
+    isProcessingRef.current = true;
+    setIsListening(false);
+
     try {
       const base64 = await blobToBase64(audioBlob);
 
-      // Transcribe
+      console.log('📝 Transcribing audio...');
       const sttResponse = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/speech-to-text`,
         {
@@ -250,11 +327,21 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       );
 
       const sttData = await sttResponse.json();
-      if (!sttData.text || sttData.text.length < 2) return;
+      console.log('📝 Transcription result:', sttData.text);
 
+      if (!sttData.text || sttData.text.trim().length < 2) {
+        console.log('⚠️ Empty or too short transcription, skipping');
+        isProcessingRef.current = false;
+        setIsListening(true);
+        return;
+      }
+
+      // Add user message to transcript
       setTranscript(prev => [...prev, { role: 'user', text: sttData.text }]);
 
-      // Get AI response with speech plan
+      console.log('🤖 Getting AI response for:', sttData.text);
+      
+      // Get AI response
       const response = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/voice-orchestrator`,
         {
@@ -265,7 +352,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
             conversationId: conversationIdRef.current,
             userMessage: sttData.text,
             emotionalContext: {
-              detectedEmotion: sttData.emotion,
+              detectedEmotion: sttData.emotion || 'neutral',
               silenceBeforeMs: Date.now() - lastUserSpeechTime,
               isInterruption: isInterruptionRef.current
             }
@@ -274,34 +361,30 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       );
 
       const aiData = await response.json();
+      console.log('🤖 AI Response:', aiData.response);
+
       if (aiData.error) throw new Error(aiData.error);
 
-      setCurrentEmotion(aiData.emotion);
+      setCurrentEmotion(aiData.emotion || 'neutral');
       setTranscript(prev => [...prev, { role: 'assistant', text: aiData.response }]);
 
-      // Apply thinking delay before speaking
+      // Apply thinking delay
       if (aiData.thinkingDelayMs > 0) {
-        await new Promise(r => setTimeout(r, aiData.thinkingDelayMs));
+        await new Promise(r => setTimeout(r, Math.min(aiData.thinkingDelayMs, 500)));
       }
 
-      // Play TTS with speech plan segments
-      if (aiData.speechPlan?.segments) {
-        for (const segment of aiData.speechPlan.segments) {
-          if (isInterruptionRef.current) break;
-          await playTTS(segment.text, aiData.emotion, segment.pace || 1.0);
-          if (segment.pauseAfterMs && segment.pauseAfterMs > 0) {
-            await new Promise(r => setTimeout(r, segment.pauseAfterMs));
-          }
-        }
-      } else {
-        await playTTS(aiData.response, aiData.emotion);
-      }
+      // Play TTS response
+      isInterruptionRef.current = false;
+      await playTTS(aiData.response, aiData.emotion || 'warm');
 
     } catch (error) {
       console.error('Processing error:', error);
+      toast({ title: 'Error processing audio', variant: 'destructive' });
     } finally {
       setLastUserSpeechTime(Date.now());
       isInterruptionRef.current = false;
+      isProcessingRef.current = false;
+      setIsListening(true);
     }
   };
 
@@ -318,6 +401,20 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
   };
 
   const endCall = async () => {
+    // Cleanup
+    if (vadAnimationRef.current) {
+      cancelAnimationFrame(vadAnimationRef.current);
+    }
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+    }
+
     if (conversationIdRef.current) {
       await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/voice-orchestrator`,
@@ -329,30 +426,39 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       );
     }
 
-    mediaRecorderRef.current?.stream.getTracks().forEach(t => t.stop());
     setStatus('ended');
     onEndCall();
+  };
+
+  const toggleMute = () => {
+    setIsMuted(prev => {
+      const newMuted = !prev;
+      if (streamRef.current) {
+        streamRef.current.getAudioTracks().forEach(track => {
+          track.enabled = !newMuted;
+        });
+      }
+      return newMuted;
+    });
   };
 
   useEffect(() => {
     startConversation();
     return () => {
-      mediaRecorderRef.current?.stream.getTracks().forEach(t => t.stop());
+      if (vadAnimationRef.current) {
+        cancelAnimationFrame(vadAnimationRef.current);
+      }
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current);
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+      }
     };
   }, []);
 
   return (
     <div className="w-full max-w-md mx-auto space-y-6 relative">
-      {/* Test Sound Button */}
-      <Button
-        variant="ghost"
-        size="sm"
-        className="absolute top-0 right-0 text-xs"
-        onClick={testAudio}
-      >
-        Test Sound
-      </Button>
-
       {/* Avatar */}
       <div className="relative mx-auto w-32 h-32">
         <div className={`w-full h-full rounded-full bg-gradient-to-br from-primary to-primary/60 flex items-center justify-center text-5xl transition-all ${isSpeaking ? 'animate-pulse scale-105' : ''}`}>
@@ -367,14 +473,19 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       <div className="text-center">
         <p className="text-lg font-medium">Priya</p>
         <p className="text-sm text-muted-foreground">
-          {status === 'connecting' ? 'Connecting...' : isSpeaking ? 'Speaking...' : 'Listening...'}
+          {status === 'connecting' ? 'Connecting...' : 
+           isSpeaking ? 'Speaking...' : 
+           isProcessingRef.current ? 'Thinking...' :
+           isListening ? 'Listening...' : 'Ready'}
         </p>
+        {isMuted && <p className="text-xs text-destructive mt-1">Muted</p>}
       </div>
 
       {/* Transcript */}
       <div className="h-48 overflow-y-auto space-y-2 p-4 bg-muted/30 rounded-lg">
         {transcript.map((msg, i) => (
           <div key={i} className={`text-sm ${msg.role === 'user' ? 'text-right text-muted-foreground' : 'text-left'}`}>
+            <span className="text-xs opacity-60 mr-1">{msg.role === 'user' ? 'You:' : 'Priya:'}</span>
             {msg.text}
           </div>
         ))}
@@ -383,10 +494,10 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       {/* Controls */}
       <div className="flex justify-center gap-4">
         <Button
-          variant="outline"
+          variant={isMuted ? "destructive" : "outline"}
           size="icon"
           className="w-14 h-14 rounded-full"
-          onClick={() => setIsMuted(!isMuted)}
+          onClick={toggleMute}
         >
           {isMuted ? <MicOff /> : <Mic />}
         </Button>
