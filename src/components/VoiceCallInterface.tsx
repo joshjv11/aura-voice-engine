@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Phone, PhoneOff, Mic, MicOff } from "lucide-react";
+import { Mic, MicOff, PhoneOff } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 
 interface VoiceCallInterfaceProps {
@@ -10,12 +17,21 @@ interface VoiceCallInterfaceProps {
 const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
   const { toast } = useToast();
   const [status, setStatus] = useState<'connecting' | 'active' | 'ended'>('connecting');
+  const [uiPhase, setUiPhase] = useState<
+    'connecting' | 'listening' | 'transcribing' | 'thinking' | 'speaking' | 'ended'
+  >('connecting');
   const [isMuted, setIsMuted] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isListening, setIsListening] = useState(false);
   const [currentEmotion, setCurrentEmotion] = useState('neutral');
   const [transcript, setTranscript] = useState<Array<{ role: string; text: string }>>([]);
   const [lastUserSpeechTime, setLastUserSpeechTime] = useState(Date.now());
+
+  const [voices, setVoices] = useState<
+    Array<{ voice_id: string; name: string; labels?: Record<string, string> }>
+  >([]);
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string>('cgSgspJ2msm6clMCkdW9');
+
+  const isSpeaking = uiPhase === 'speaking';
+  const isListening = uiPhase === 'listening';
 
   const conversationIdRef = useRef<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -26,22 +42,30 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isRecordingRef = useRef(false);
+  const recordingStartRef = useRef<number | null>(null);
   const vadAnimationRef = useRef<number | null>(null);
 
-  // VAD configuration
-  const SILENCE_THRESHOLD = 25; // Lower = more sensitive
-  const SILENCE_DURATION = 1500; // ms of silence before processing
-  const MIN_SPEECH_DURATION = 300; // ms minimum speech before considering valid
+  // VAD configuration (lower values = faster turn-taking)
+  const SILENCE_THRESHOLD_RMS = 0.014; // RMS threshold (0..1) for "voice present"
+  const SILENCE_DURATION = 650; // ms of silence before we stop + process
+  const MIN_SPEECH_DURATION = 250; // ms minimum speech before considering valid
+  const MAX_RECORDING_MS = 12000; // hard cap so we never upload huge blobs
 
   const startConversation = useCallback(async () => {
     try {
+      setUiPhase('connecting');
+
       const response = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/voice-orchestrator`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          },
           body: JSON.stringify({ action: 'start' })
         }
       );
@@ -54,6 +78,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       setStatus('active');
 
       // Play greeting audio
+      setUiPhase('thinking');
       await playTTS(data.greeting, 'excited');
 
       // Start continuous listening with VAD
@@ -79,7 +104,6 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         }
 
         console.log('🎤 ElevenLabs TTS:', text.substring(0, 50) + '...', 'Emotion:', emotion);
-        setIsSpeaking(true);
 
         const response = await fetch(
           `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/elevenlabs-tts`,
@@ -87,13 +111,14 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'apikey': import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+              apikey: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+              Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
             },
             body: JSON.stringify({
               text,
               emotion,
-              streaming: false, // Use non-streaming for better quality
+              voiceId: selectedVoiceId,
+              streaming: false,
             }),
           }
         );
@@ -110,7 +135,6 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         if (isInterruptionRef.current) {
           console.log('Interruption before play, skipping');
           URL.revokeObjectURL(audioUrl);
-          setIsSpeaking(false);
           resolve();
           return;
         }
@@ -120,24 +144,26 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
         audio.volume = 1.0;
 
         audio.onended = () => {
-          setIsSpeaking(false);
           audioRef.current = null;
           URL.revokeObjectURL(audioUrl);
+          if (status === 'active' && !isMuted) setUiPhase('listening');
           resolve();
         };
 
         audio.onerror = (e) => {
           console.error('Audio playback error:', e);
-          setIsSpeaking(false);
+          audioRef.current = null;
           URL.revokeObjectURL(audioUrl);
+          if (status === 'active' && !isMuted) setUiPhase('listening');
           resolve();
         };
 
+        setUiPhase('speaking');
         await audio.play();
 
       } catch (error) {
         console.error('TTS error:', error);
-        setIsSpeaking(false);
+        if (status === 'active' && !isMuted) setUiPhase('listening');
         resolve();
       }
     });
