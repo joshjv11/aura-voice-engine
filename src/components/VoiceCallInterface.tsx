@@ -229,7 +229,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       
       // Start initial recording
       startRecording();
-      setIsListening(true);
+      setUiPhase('listening');
 
     } catch (error) {
       console.error('Mic error:', error);
@@ -275,10 +275,10 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       }
       const average = sum / bufferLength;
 
-      const isSpeaking = average > SILENCE_THRESHOLD;
+      const isSpeakingNow = average > SILENCE_THRESHOLD_RMS * 255;
       const now = Date.now();
 
-      if (isSpeaking) {
+      if (isSpeakingNow) {
         if (!speechStartTime) {
           speechStartTime = now;
         }
@@ -303,7 +303,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
                 if (audioRef.current.volume <= 0.1) {
                   audioRef.current.pause();
                   audioRef.current = null;
-                  setIsSpeaking(false);
+                  setUiPhase('listening');
                   clearInterval(fadeOut);
                 }
               } else {
@@ -337,7 +337,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
     if (isProcessingRef.current) return;
     
     isProcessingRef.current = true;
-    setIsListening(false);
+    setUiPhase('transcribing');
 
     try {
       const base64 = await blobToBase64(audioBlob);
@@ -358,9 +358,11 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       if (!sttData.text || sttData.text.trim().length < 2) {
         console.log('⚠️ Empty or too short transcription, skipping');
         isProcessingRef.current = false;
-        setIsListening(true);
+        setUiPhase('listening');
         return;
       }
+      
+      setUiPhase('thinking');
 
       // Add user message to transcript
       setTranscript(prev => [...prev, { role: 'user', text: sttData.text }]);
@@ -410,7 +412,7 @@ const VoiceCallInterface = ({ onEndCall }: VoiceCallInterfaceProps) => {
       setLastUserSpeechTime(Date.now());
       isInterruptionRef.current = false;
       isProcessingRef.current = false;
-      setIsListening(true);
+      if (status === 'active' && !isMuted) setUiPhase('listening');
     }
   };
 
