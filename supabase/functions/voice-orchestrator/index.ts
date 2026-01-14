@@ -175,28 +175,9 @@ serve(async (req) => {
       // Determine response emotion and pacing
       const responseAnalysis = analyzeResponse(aiResponse, emotionalState);
 
-      // Calculates Meaningful Pause (Contextual Latency)
-      // Human Illusion Phase 1: Pauses for reasons, not random.
-      let thinkingDelayMs = 500; // Default: neutral/engaged
-
-      switch (responseAnalysis.emotion) {
-        case 'thoughtful':
-        case 'sad':
-        case 'concerned':
-          thinkingDelayMs = 800 + Math.random() * 200; // 800-1000ms: Deep processing/empathy
-          break;
-        case 'affectionate':
-        case 'intimate':
-          thinkingDelayMs = 600 + Math.random() * 200; // 600-800ms: Warm, lingering
-          break;
-        case 'playful':
-        case 'excited':
-        case 'happy':
-          thinkingDelayMs = 200 + Math.random() * 150; // 200-350ms: Snappy, witty
-          break;
-        default:
-          thinkingDelayMs = 400 + Math.random() * 200; // 400-600ms: Casual conversation
-      }
+      // Low-latency mode: don't add artificial "thinking" pauses.
+      // (UI can still show "Thinking..." while transcription + response generation runs.)
+      const thinkingDelayMs = 0;
 
       // Generate Speech Plan (Prosody + Pauses)
       const speechPlan = planSpeech(aiResponse, responseAnalysis.emotion);
@@ -311,8 +292,8 @@ async function generateAIResponse(
     body: JSON.stringify({
       model: 'google/gemini-2.5-flash',
       messages,
-      temperature: 0.85,
-      max_tokens: 200
+      temperature: 0.8,
+      max_tokens: 120
     })
   });
 

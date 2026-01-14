@@ -45,18 +45,19 @@ serve(async (req) => {
     // Voice settings optimized for Indian/Hindi speech patterns
     const voiceSettings = getEmotionSettings(emotion || 'neutral');
 
-    // ALWAYS use eleven_multilingual_v2 for proper Hindi pronunciation
-    // It naturally adopts Indian accent when processing Hinglish text
-    const modelId = 'eleven_multilingual_v2';
+    // Low-latency model (still very high quality)
+    const modelId = 'eleven_turbo_v2_5';
 
-    // Use streaming for lowest latency
+    // Smaller audio = faster generation + faster download
+    const outputFormat = 'mp3_22050_32';
+
     const endpoint = streaming
-      ? `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}/stream?output_format=mp3_22050_32`
-      : `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}?output_format=mp3_44100_128`;
+      ? `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}/stream?output_format=${outputFormat}`
+      : `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}?output_format=${outputFormat}`;
 
     // Process text for better Hindi pronunciation
     const processedText = processHinglishText(text);
-    
+
     console.log(`ElevenLabs TTS: "${processedText.substring(0, 50)}..." model: ${modelId}, emotion: ${emotion}`);
 
     const response = await fetch(endpoint, {
@@ -69,8 +70,6 @@ serve(async (req) => {
         text: processedText,
         model_id: modelId,
         voice_settings: voiceSettings,
-        // Language hint for better Hindi pronunciation
-        language_code: 'hi', // Hindi - helps with pronunciation
       }),
     });
 
