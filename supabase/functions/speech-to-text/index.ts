@@ -29,7 +29,8 @@ serve(async (req) => {
     }
 
     const audioBytes = base64Decode(audio);
-    const audioBlob = new Blob([audioBytes], { type: "audio/webm" });
+    const audioBuffer = new Uint8Array(audioBytes).buffer;
+    const audioBlob = new Blob([audioBuffer], { type: "audio/webm" });
 
     const apiFormData = new FormData();
     apiFormData.append("file", audioBlob, "audio.webm");
